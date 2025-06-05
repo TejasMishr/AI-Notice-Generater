@@ -10,8 +10,20 @@ from google.genai import types
 # Load environment variables from .env file
 load_dotenv()
 
-# Gemini model to use (change to your own fine-tuned if needed)
 MODEL_NAME = "gemma-3-12b-it"
+
+NOTICE_TYPE_PROMPTS = {
+    "Prize Distribution": "The Prize Distribution ceremony aims to recognize students' achievements in academics, sports, and extracurricular activities.",
+    "Holiday Notice": "This notice informs all students and staff about an upcoming school holiday as declared by the administration.",
+    "Exam Schedule": "This is to notify about the schedule of upcoming examinations. Students are required to be present on time.",
+    "Parent Meeting": "A parent-teacher meeting has been scheduled to discuss students' academic progress and address any concerns.",
+    "Sports Event": "The annual sports event will be held to encourage sportsmanship and healthy competition among students.",
+    "Cultural Program": "All are invited to attend the school's annual cultural program featuring various performances and activities.",
+    "Fee Payment": "This is a reminder to students and parents regarding the due date for the upcoming fee payment.",
+    "Admission Notice": "Admissions for the new academic session are now open. Interested applicants should submit the required documents.",
+    "Result Declaration": "The results of the recent examinations will be declared. Students are requested to check the official notice board.",
+    "School Closure": "The school will remain closed due to unforeseen circumstances as per administrative orders.",
+}
 
 app = FastAPI(
     title="School Notice Generator",
@@ -56,13 +68,14 @@ class NoticeRequest(BaseModel):
     signature_title: str = Field(default="Principal", description="Authority signing the notice")
 
 def generate_raw_notice(input_fields: dict, model: str = MODEL_NAME) -> str:
-
-    # Generating a formal school notice in HTML using Gemini/Gemma LLM. If the user has not provided event_date or contact_info, the output will show <strong>[Placeholder]</strong> instead of inventing dates.
-
+    notice_type = input_fields.get("notice_type", "General Notice")
+    custom_prompt = NOTICE_TYPE_PROMPTS.get(notice_type, "")
 
     system_instructions = (
-        "You are a professional administrative assistant for a school. "
-        "Generate a polished, formal school notice following these EXACT specifications:\n\n"
+        f"You are a professional administrative assistant for a school. "
+        f"Generate a polished, formal school notice for the type: <strong>{notice_type}</strong>."
+        "\n\n"
+        "Please follow these EXACT specifications:\n\n"
         "OUTPUT FORMAT:\n"
         "1. Title: <p><strong>[NOTICE TYPE] NOTICE</strong></p>\n"
         "2. Spacing: <p><br></p>\n"
@@ -89,21 +102,18 @@ def generate_raw_notice(input_fields: dict, model: str = MODEL_NAME) -> str:
         "2. Clear and concise\n"
         "3. Formal but not overly complex\n"
         "4. Direct and informative\n"
-        "5. Appropriate for educational context"
+        "5. Appropriate for educational context\n\n"
+        f"NOTICE TYPE GUIDANCE:\n{custom_prompt}\n"
+        "If the notice type is not recognized, use a formal, generic tone."
     )
 
     def safe_get(key: str) -> str:
-        """
-        If the user provided a nonempty string for `key`, return it.
-        Otherwise, return the placeholder wrapped in <strong>.
-        """
         val = input_fields.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
+        if key == "key_details" and custom_prompt:
+            return custom_prompt
         return "[Placeholder]"
-
-
-    # If not provided, safe_get will cause the model to see "[Placeholder]".
 
     input_block = (
         "SCHOOL NOTICE DETAILS:\n"
@@ -157,7 +167,6 @@ def generate_raw_notice(input_fields: dict, model: str = MODEL_NAME) -> str:
 
 @app.post("/generate-notice", summary="Generate a school notice", response_model=dict)
 async def create_notice(notice_request: NoticeRequest):
-   
     notice_html = generate_raw_notice(notice_request.dict())
     return {"notice": notice_html}
 
