@@ -3,17 +3,18 @@ import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional
 from google import genai
 from google.genai import types
 
-
+# Load environment variables from .env file
 load_dotenv()
 
 MODEL_NAME = "gemma-3-12b-it"
-MAX_NOTICE_WORDS = 200
-PLACEHOLDER = "<strong>[Insert here]</strong>"
+
+# ----------- NOTICE TYPE PROMPTS -----------
 
 NOTICE_TYPE_PROMPTS = {
     "Prize Distribution": (
@@ -59,6 +60,8 @@ NOTICE_TYPE_PROMPTS = {
     ),
 }
 
+# ----------- FASTAPI SETUP -----------
+
 app = FastAPI(
     title="School Notice Generator",
     description="API for generating formal school notices using Gemini LLM",
@@ -73,24 +76,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------- REQUEST SCHEMA -----------
+
 class NoticeRequest(BaseModel):
     notice_type: str = Field(default="General Notice", description="Type of notice")
-    event_date: Optional[str] = Field(default=None, description="Event date (e.g. 'June 20, 2025')")
-    key_details: str = Field(default="", description="Key details or summary")
-    recipient: Optional[str] = Field(default=None, description="Intended recipients (e.g. 'All Students and Parents')")
-    venue: Optional[str] = Field(default=None, description="Venue for the event (e.g. 'School Auditorium')")
-    time: Optional[str] = Field(default=None, description="Event time (e.g. '5:00 PM')")
-    contact_info: Optional[str] = Field(default=None, description="Contact information (e.g. 'office@school.edu | (555) 123-4567')")
+    event_date: Optional[str] = Field(default=None, description="Event date")
+    key_details: str = Field(default="Annual cultural program and prize distribution", description="Key details or summary")
+    recipient: Optional[str] = Field(default=None, description="Intended recipients")
+    venue: Optional[str] = Field(default=None, description="Venue for the event")
+    time: Optional[str] = Field(default=None, description="Event time")
+    contact_info: Optional[str] = Field(default=None, description="Contact information")
     signature_title: str = Field(default="Principal", description="Authority signing the notice")
 
-def extract_details_from_text(text: str) -> Dict[str, Optional[str]]:
-    """
-    Attempt to extract event details from the given text using regex.
-    """
-    # Patterns for different fields (improved for variety)
+# ----------- UTILITIES -----------
+
+def extract_details_from_text(text: str) -> dict:
     date_pattern = r'\b(?:on\s*)?([A-Z][a-z]+\s\d{1,2},\s\d{4})\b'
     time_pattern = r'\b(?:at\s*)?(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\b'
-    venue_pattern = r'(?:in|at)\s+([A-Z][A-Za-z0-9\s\-]*(?:Auditorium|Hall|Ground|Room|Center|Block|Building|Lab|Field))'
+    venue_pattern = r'(?:in|at)\s+([A-Z][A-Za-z0-9\s\-]*(Auditorium|Hall|Ground|Room|Center|Block|Building|Lab|Field))'
     recipient_pattern = r'\b(?:for|to|all|for all)\s+([A-Za-z\s&]+?)(?:\.|,|;|$)'
     contact_pattern = r'([a-zA-Z0-9.\-_]+@[a-zA-Z0-9.\-_]+\.[a-zA-Z]+|\(\d{3}\)\s?\d{3}[-.\s]?\d{4})'
 
@@ -102,84 +105,61 @@ def extract_details_from_text(text: str) -> Dict[str, Optional[str]]:
         "contact_info": re.search(contact_pattern, text).group(1) if re.search(contact_pattern, text) else None,
     }
 
-def preprocess_notice_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fill missing fields by extracting them from 'key_details', if possible.
-    """
-    details = extract_details_from_text(fields.get("key_details", "") or "")
+def preprocess_notice_fields(fields: dict) -> dict:
+    details = extract_details_from_text(fields.get("key_details", ""))
     for k, v in details.items():
         if not fields.get(k) and v:
             fields[k] = v
     return fields
 
-def build_system_instructions(notice_type: str, custom_prompt: str) -> str:
-    """
-    Build a strict, detailed system instruction prompt for the LLM.
-    """
+def build_system_instructions(notice_type, custom_prompt):
     return (
         f"You are an expert administrative assistant for a school, drafting formal notices.\n\n"
         "Your task:\n"
         "- Generate a concise, formal school notice of the specified type (<strong>[NOTICE TYPE]</strong>).\n"
         "- STRICTLY follow the OUTPUT FORMAT and RULES below.\n"
-        f"- If any required field (Date, Time, Venue, Recipient, Contact Info) is missing, carefully examine the 'Key Details' text for possible information. "
-        f"Only fill in if confidently found; otherwise, use {PLACEHOLDER}.\n"
+        "- If any required field is missing, extract from Key Details or use <strong>[Placeholder]</strong>.\n"
         "- NEVER invent or assume information not present in input.\n\n"
         "OUTPUT FORMAT:\n"
         "1. Title: <p><strong>[NOTICE TYPE] NOTICE</strong></p>\n"
         "2. Spacing: <p><br></p>\n"
-        "3. Body Structure (each in separate <p> tags):\n"
-        "   - Opening: <p>This is to inform [Recipient] that [Event Type/Notice Subject]...</p>\n"
-        "   - Main Information: <p>[Provide the main message, including reasons or instructions, e.g., 'The event will take place on [Date] at [Time] in [Venue].']</p>\n"
-        "   - Additional Details: <p>[Key Details, such as highlights, specific requirements, or important instructions]</p>\n"
-        "   - Contact: <p>For further information, please contact: [Contact Info]</p>\n"
-        "   - Authority: <p><strong>[Signature Title]</strong></p>\n"
+        "3. Body:\n"
+        "<p>This is to inform [Recipient] that [Event Type/Notice Subject]...</p>\n"
+        "<p>The event will take place on [Date] at [Time] in [Venue].</p>\n"
+        "<p>[Extra Instructions]</p>\n"
+        "<p>For further information, please contact: [Contact Info]</p>\n"
+        "<p><strong>Regards,<br> </strong>\n"
+        "<strong>[Signature Title]</strong></p>\n\n"
         "STRICT RULES:\n"
-        "1. NEVER include school name or date of issue.\n"
-        "2. NEVER invent details not given or extractable from 'Key Details'.\n"
-        "3. Use ONLY <p>, <strong>, <br> tags.\n"
-        f"4. Replace missing information with {PLACEHOLDER}.\n"
-        f"5. Max total notice: {MAX_NOTICE_WORDS} words.\n"
-        "6. Language: Formal, professional, clear, academic.\n"
-        "7. No bullet points or extra formatting.\n"
-        "8. No comments, explanations, or meta-output.\n\n"
-        "EXTRACTION INSTRUCTIONS:\n"
-        "- For each field (Date, Time, Venue, Recipient, Contact Info), first use the direct field value.\n"
-        "- If missing, extract from 'Key Details' if clearly stated (e.g., 'The meeting will be at 10:00 AM in the Main Hall on June 14.').\n"
-        f"- If you cannot find it, use {PLACEHOLDER}.\n\n"
-        f"NOTICE TYPE GUIDANCE:\n{custom_prompt}\n"
-        "If the notice type is not recognized, use a formal, generic tone."
+        "1. No school name, issue date, or bullet points.\n"
+        "2. Only use <p>, <strong>, <br> tags.\n"
+        "3. Max 250 words.\n"
+        "4. Use formal and professional tone.\n\n"
+        f"NOTICE TYPE GUIDANCE:\n{custom_prompt}"
     )
 
-def safe_get(fields: Dict[str, Any], key: str, custom_prompt: str) -> str:
-    """
-    Get the field value or use placeholder or custom prompt.
-    """
-    val = fields.get(key)
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    if key == "key_details" and custom_prompt:
-        return custom_prompt
-    return PLACEHOLDER
+# ----------- NOTICE GENERATOR -----------
 
-def generate_raw_notice(input_fields: Dict[str, Any], model: str = MODEL_NAME) -> str:
-    """
-    Generate a formal school notice using the Gemini LLM.
-    """
+def generate_raw_notice(input_fields: dict, model: str = MODEL_NAME) -> str:
     notice_type = input_fields.get("notice_type", "General Notice")
     custom_prompt = NOTICE_TYPE_PROMPTS.get(notice_type, "")
 
     system_instructions = build_system_instructions(notice_type, custom_prompt)
 
+    def safe_get(key: str) -> str:
+        val = input_fields.get(key)
+        return val.strip() if isinstance(val, str) and val.strip() else "[Placeholder]"
+
     input_block = (
         "SCHOOL NOTICE DETAILS:\n"
-        f"- Notice Type: {safe_get(input_fields, 'notice_type', custom_prompt)} Notice\n"
-        f"- Key Details: {safe_get(input_fields, 'key_details', custom_prompt)}\n"
-        f"- Event Date: {safe_get(input_fields, 'event_date', custom_prompt)}\n"
-        f"- Event Time: {safe_get(input_fields, 'time', custom_prompt)}\n"
-        f"- Venue: {safe_get(input_fields, 'venue', custom_prompt)}\n"
-        f"- Recipient: {safe_get(input_fields, 'recipient', custom_prompt)}\n"
-        f"- Contact Info: {safe_get(input_fields, 'contact_info', custom_prompt)}\n"
-        f"- Signature Title: {safe_get(input_fields, 'signature_title', custom_prompt)}"
+        f"- Notice Type: {safe_get('notice_type')} Notice\n"
+        f"- Key Details: {safe_get('key_details')}\n"
+        f"- Event Date: {safe_get('event_date')}\n"
+        f"- Event Time: {safe_get('time')}\n"
+        f"- Venue: {safe_get('venue')}\n"
+        f"- Recipient: {safe_get('recipient')}\n"
+        f"- Contact Info: {safe_get('contact_info')}\n"
+        f"- Signature Title: {safe_get('signature_title')}"
     )
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -198,7 +178,7 @@ def generate_raw_notice(input_fields: Dict[str, Any], model: str = MODEL_NAME) -
     config = types.GenerateContentConfig(
         max_output_tokens=1024,
         response_mime_type="text/plain",
-        temperature=0.4,
+        temperature=0.7,
     )
 
     try:
@@ -208,7 +188,20 @@ def generate_raw_notice(input_fields: Dict[str, Any], model: str = MODEL_NAME) -
             config=config,
         )
         if hasattr(response, "text") and response.text:
-            return response.text.strip()
+            notice_body = response.text.strip()
+            full_html = f"""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <title>{safe_get('notice_type')} Notice</title>
+                </head>
+                <body>
+                    {notice_body}
+                </body>
+                </html>
+            """
+            return full_html
         else:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -220,18 +213,14 @@ def generate_raw_notice(input_fields: Dict[str, Any], model: str = MODEL_NAME) -
             detail=f"Error communicating with Gemini: {str(e)}"
         )
 
-@app.post("/generate-notice", summary="Generate a school notice", response_model=dict)
+# ----------- API ROUTES -----------
+
+@app.post("/generate-notice", summary="Generate a school notice", response_class=HTMLResponse)
 async def create_notice(notice_request: NoticeRequest):
-    """
-    Generate a school notice based on user input, auto-extracting fields from key_details if necessary.
-    """
     fields = preprocess_notice_fields(notice_request.dict())
     notice_html = generate_raw_notice(fields)
-    return {"notice": notice_html}
+    return HTMLResponse(content=notice_html, status_code=200)
 
 @app.get("/", summary="Health check")
 async def root():
-    """
-    Health check endpoint.
-    """
     return {"message": "School Notice Generator API is running."}
